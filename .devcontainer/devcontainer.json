@@ -1,0 +1,51 @@
+{
+    "name": "Python 3",
+    "build": {
+        "dockerfile": "../Dockerfile",
+        "context": "..",
+        "args": {
+            "INSTALL_VSCODE": "1"
+        }
+    },
+    // Some config for Git
+    "remoteEnv": {
+        "GIT_NAME": "USERNAME",
+        "GIT_EMAIL": "user@email.com"
+    },
+    "postCreateCommand": "git config --global --add safe.directory ${containerWorkspaceFolder} && git config --global user.email \"${GIT_EMAIL}\" && git config --global user.name \"${GIT_NAME}\"",
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "python.defaultInterpreterPath": "/usr/local/bin/python",
+                "jupyter.kernels.filter": [
+                    {
+                      "path": "/usr/local/bin/python"
+                    }
+                ],
+                "flake8.args": [
+                    "--config",
+                    "${containerWorkspaceFolder}/.flake8"
+                ],
+                "pylint.args": [
+                    "--rcfile=${containerWorkspaceFolder}/.pylintrc"
+                ],
+                // "editor.defaultFormatter": "ms-python.black-formatter",
+                // "editor.formatOnSave": true
+            },
+            "extensions": [
+                "ms-python.python",
+                "ms-toolsai.jupyter",
+                // "ms-python.flake8",
+                // "ms-python.pylint",
+                // "ms-python.black-formatter",
+                "kevinrose.vsc-python-indent",
+                "GitHub.copilot",
+                "GitHub.copilot-chat"
+            ]
+        }
+    }
+    // Use the following to include extern files from the Nextcloud
+    // "mounts": [
+    //   "source=/pathToExternSource"
+    // ]
+}
