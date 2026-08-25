@@ -28,7 +28,7 @@ def prepare_DLBCL_SES_cohort(cohort):
     # remove 2025 due to too few values
     # Kaplan-Meier curves for register_id 10 show significant deviation – exclude to ensure comparability
     cohort = cohort[~cohort["diagnosis_year"].isin([2025])]
-    cohort = cohort[~cohort["register_id"].isin(["10", "11", "12"])]
+    # cohort = cohort[~cohort["register_id"].isin(["10", "11", "12"])]
                     
     # 4. keep only observation times between 93 and 1827 days. If observation time exceeds 1827 days, cap it at 1827.
     cohort["observation_end_date"] = pd.to_datetime(cohort["observation_end_date"])
@@ -57,12 +57,17 @@ def prepare_DLBCL_SES_cohort(cohort):
         right_on=["year", "district_id"],
         how="inner"
     )
-    cohord_gisd = cohord_gisd.drop(columns=['district_name', 'year', 'gisd_5', 'gisd_10', 'gisd_k', 'join_year'])
+    cohord_gisd = cohord_gisd.drop(columns=['district_name', 'year', 'gisd_10', 'gisd_k', 'join_year'])
     print(f"control: cohort size after join with gisd: {cohord_gisd.shape}")
 
     # 7. add gisd SES (socio-economic status) -> low (5th), middle (2th - 4th), high (1th) 
     # GISD Quintile: 1 - 5 (5 = highest level of deprivation)
+    # a) quintile over avaialable districts (in paper used)
     cohord_gisd["gisd_quintile"] = pd.qcut(cohord_gisd["gisd_score"], q=5, labels=False) + 1
+    # b) quintile over total germany
+    # cohord_gisd["gisd_quintile"] = cohord_gisd["gisd_5"]
+    cohord_gisd = cohord_gisd.drop(columns=['gisd_5'])
+    
     cohord_gisd["ses"] = cohord_gisd["gisd_quintile"].map({
         1: "high",
         2: "middle",
@@ -197,7 +202,7 @@ def kaplan_meier_analysis(cohort):
     kmf = KaplanMeierFitter()
     plt.figure(figsize=(10, 6))
 
-    colors = {'low': '#cc2a36', 'middle': '#8b8589', 'high': '#005582'}
+    colors = {'low': '#cc2a36', 'middle': "#6b686a", 'high': '#005582'}
     legend_order = ['low', 'middle', 'high']
 
     # Years converted to days
@@ -213,10 +218,21 @@ def kaplan_meier_analysis(cohort):
         E = pd.to_numeric(cohort[mask]['survival_status'], errors='coerce')
 
         kmf.fit(T, event_observed=E, label=str(group))
-        kmf.plot_survival_function(ci_show=False, color=colors.get(group, None))
+        
+        ci = kmf.confidence_interval_
+        ci = ci.reindex(kmf.survival_function_.index).ffill()
+        ci_at_times = ci.reindex(
+            ci.index.union(time_points)
+        ).sort_index().ffill().loc[time_points]
+        ci_at_times.index = year_labels
+        print(f"\nGroup: {group}")
+        print(ci_at_times)
+                
+        kmf.plot_survival_function(ci_show=True, color=colors.get(group, None), ci_alpha=0.2)
 
         # --- 1. Estimated absolute survival count ---
         survival_prob = kmf.survival_function_.asof(time_points).squeeze()
+        print(f"{group} survival probabilities:\n{survival_prob}")
         n_group = mask.sum()
         abs_surv = (survival_prob * n_group).round().astype(int)
         abs_surv.index = year_labels
@@ -323,83 +339,123 @@ def kaplan_meier_analysis(cohort):
 
     print("\n=== Observed number at risk ===")
     print(at_risk_df)
-    
-def cox_model_analysis(cohort):
-    def run_cox_model(cohort, description):
-        cohort = cohort.copy()
-        cohort['ses'] = pd.Categorical(cohort['ses'], categories=['low', 'middle', 'high'], ordered=True)
-        dummies = pd.get_dummies(cohort['ses'], drop_first=True)  # drops 'low', keeps 'middle' and 'high'
-        cohort = pd.concat([cohort, dummies], axis=1)
-        counts_by_ses = cohort.groupby('ses')['survival_status'].agg(['count', 'sum']).rename(columns={'count': 'n_ses', 'sum': 'events_ses'})
-        cohort =cohort.drop(columns=['ses']) 
 
-        # dummy variables for categorical features: 'diagnosis_year' and 'register_id'
-        dummy_parts = []
-        if 'diagnosis_year' in cohort.columns:
-            dummies_year = pd.get_dummies(cohort['diagnosis_year'], prefix='year', drop_first=True)
-            dummy_parts.append(dummies_year)
-            cohort = cohort.drop(columns=['diagnosis_year'])
-            
-        if 'register_id' in cohort.columns:
-            dummies_state = pd.get_dummies(cohort['register_id'], prefix='state', drop_first=True)
-            dummy_parts.append(dummies_state)
-            cohort = cohort.drop(columns=['register_id'])
-        cohort = pd.concat([cohort] + dummy_parts, axis=1)
-        
-        cph = CoxPHFitter()
-        cph.fit(cohort, duration_col='survival_time', event_col='survival_status', cluster_col='district_id')
 
-        summary = cph.summary.loc[['middle', 'high']][['exp(coef)', 'exp(coef) lower 95%', 'exp(coef) upper 95%']]
-        summary.columns = ['HR', 'CI_lower', 'CI_upper']
-        summary['Subgroup'] = description
-        summary['Variable'] = summary.index
-        summary['n'] = summary['Variable'].map(counts_by_ses['n_ses'])
-        summary['events'] = summary['Variable'].map(counts_by_ses['events_ses'])
-        summary.reset_index(drop=True, inplace=True)
-        return summary
-    
-    results = []
+# --- Cox models -------------------------------------------------------------
 
+SUBGROUP_SPECS = [
+    ("Unadjusted",
+     lambda c: c.drop(columns=['register_id', 'sex', 'diagnosis_year', 'age', 'age_60_plus',
+                               'gisd_score', 'one_year_death_prob_general',
+                               'premature_mortality', 'certified_hospital_center'])),
+    ("Adjusted",
+     lambda c: c.drop(columns=['premature_mortality'])),
+    ("Adjusted + comorbidity",
+     lambda c: c),
+    ("Adjusted + comorbidity, 2014–2019",
+     lambda c: c[c['diagnosis_year'].between(2014, 2019)]),
+    ("Adjusted + comorbidity, 2020–2024",
+     lambda c: c[c['diagnosis_year'].between(2020, 2024)]),
+    ("Adjusted + comorbidity, excl. city registries",
+     lambda c: c[~c['register_id'].isin([2, 4, 11])]),
+    ("Adjusted + comorbidity, excl. East Germany",
+     lambda c: c[~c['register_id'].isin([12, 13, 14, 15, 16])]),
+]
+
+
+def run_cox_model(cohort, description):
+    cohort = cohort.copy()
+    cohort['ses'] = pd.Categorical(cohort['ses'], categories=['low', 'middle', 'high'], ordered=True)
+    dummies = pd.get_dummies(cohort['ses'], drop_first=True)  # drops 'low', keeps 'middle' and 'high'
+    cohort = pd.concat([cohort, dummies], axis=1)
+    counts_by_ses = cohort.groupby('ses')['survival_status'].agg(['count', 'sum']).rename(columns={'count': 'n_ses', 'sum': 'events_ses'})
+    cohort = cohort.drop(columns=['ses'])
+
+    # dummy variables for categorical features: 'diagnosis_year' and 'register_id'
+    dummy_parts = []
+    if 'diagnosis_year' in cohort.columns:
+        dummies_year = pd.get_dummies(cohort['diagnosis_year'], prefix='year', drop_first=True)
+        dummy_parts.append(dummies_year)
+        cohort = cohort.drop(columns=['diagnosis_year'])
+
+    if 'register_id' in cohort.columns:
+        dummies_state = pd.get_dummies(cohort['register_id'], prefix='state', drop_first=True)
+        dummy_parts.append(dummies_state)
+        cohort = cohort.drop(columns=['register_id'])
+    cohort = pd.concat([cohort] + dummy_parts, axis=1)
+
+    cph = CoxPHFitter()
+    cph.fit(cohort, duration_col='survival_time', event_col='survival_status', cluster_col='district_id')
+
+    summary = cph.summary.loc[['middle', 'high']][['exp(coef)', 'exp(coef) lower 95%', 'exp(coef) upper 95%']]
+    summary.columns = ['HR', 'CI_lower', 'CI_upper']
+    summary['Subgroup'] = description
+    summary['Variable'] = summary.index
+    summary['n'] = summary['Variable'].map(counts_by_ses['n_ses'])
+    summary['events'] = summary['Variable'].map(counts_by_ses['events_ses'])
+    summary.reset_index(drop=True, inplace=True)
+    return summary
+
+
+def run_all_cox_models(cohort):
     cohort = cohort.drop(columns=['person_id', 'bundesland_id'])
-    # unadjusted
-    cohort_unadj = cohort.drop(columns=['register_id', 'sex', 'diagnosis_year', 'age', 'age_60_plus', 'gisd_score', 'one_year_death_prob_general', 'premature_mortality', 'certified_hospital_center'])
-    results.append(run_cox_model(cohort_unadj, "Unadjusted"))
-    
-    # adjusted
-    cohort_adj = cohort.drop(columns=['premature_mortality'])
-    results.append(run_cox_model(cohort_adj, "Adjusted"))
+    out = pd.concat(
+        [run_cox_model(subset(cohort), description) for description, subset in SUBGROUP_SPECS],
+        ignore_index=True,
+    )
+    out['key'] = out['Subgroup'] + " - " + out['Variable']
+    return out
 
-    # adjusted + comorbidity
-    cohort_comorbid = cohort.copy()
-    results.append(run_cox_model(cohort_comorbid, "Adjusted + comorbidity"))
 
-    # subgroups by time period
-    results.append(run_cox_model(cohort[cohort['diagnosis_year'].between(2014, 2019)], "Adjusted + comorbidity, 2014–2019"))
-    results.append(run_cox_model(cohort[cohort['diagnosis_year'].between(2020, 2024)], "Adjusted + comorbidity, 2020–2024"))
+def _format_hr(row):
+    return f"{row['HR']:.2f} ({row['CI_lower']:.2f}–{row['CI_upper']:.2f})"
 
-    # subgroups by region
-    results.append(run_cox_model(cohort[~cohort['register_id'].isin([2, 4, 11])], "Adjusted + comorbidity, excl. city registries"))
-    results.append(run_cox_model(cohort[~cohort['register_id'].isin([12, 13, 14, 15, 16])], "Adjusted + comorbidity, excl. East Germany"))
-    
-    final_df = pd.concat(results, ignore_index=True)
+
+def _format_count(x):
+    return format(int(x), ",") if int(x) >= 10000 else str(int(x))
+
+
+def cox_model_analysis(cohort, cohort_extended=None):
+    final_df = run_all_cox_models(cohort)
     print(final_df)
-    
-    final_df['HR_str'] = final_df.apply(
-        lambda r: f"{r['HR']:.2f} ({r['CI_lower']:.2f}–{r['CI_upper']:.2f})", axis=1
-    )
 
-    final_df['N'] = final_df['n'].apply(
-        lambda x: format(int(x), ",") if int(x) >= 10000 else str(int(x))
-    )
-    final_df['Events'] = final_df['events'].apply(
-        lambda x: format(int(x), ",") if int(x) >= 10000 else str(int(x))
+    final_df['HR_str'] = final_df.apply(_format_hr, axis=1)
+    final_df['N'] = final_df['n'].apply(_format_count)
+    final_df['Events'] = final_df['events'].apply(_format_count)
+
+    # zweite HR-Spalte: gleiche Modelle auf der vollen Kohorte
+    if cohort_extended is not None:
+        extended_df = run_all_cox_models(cohort_extended)
+        extended_df['HR_extended'] = extended_df.apply(_format_hr, axis=1)
+        extended_df['N_extended'] = extended_df['n'].apply(_format_count)
+        extended_df['Events_extended'] = extended_df['events'].apply(_format_count)
+        final_df = final_df.merge(
+            extended_df[['key', 'HR_extended', 'N_extended', 'Events_extended']], on='key', how='left'
+        )
+        missing = final_df['HR_extended'].isna().sum()
+        if missing:
+            print(f"WARNING: {missing} Zeilen ohne Gegenstueck in der vollen Kohorte")
+        final_df['HR_extended'] = final_df['HR_extended'].fillna("")
+        final_df['N'] = final_df['N'] + " / " + final_df['N_extended'].fillna("")
+        final_df['Events'] = final_df['Events'] + " / " + final_df['Events_extended'].fillna("")
+    else:
+        final_df['HR_extended'] = ""
+
+    # add bechmark study HR rates
+    cox_benchmark_study = pd.read_csv("src/data/cox_benchmark_study.csv", sep=";", decimal=".")
+    cox_benchmark_study['key'] = cox_benchmark_study['Subgroup'] + " - " + cox_benchmark_study['Variable']
+
+    final_df = final_df.merge(
+        cox_benchmark_study[['key', 'Hazard Ratio (Reference study)']],
+        on='key',
+        how='left'
     )
 
     fig, ax = plt.subplots(figsize=(14, len(final_df) * 0.5))
 
     # plot (forestplot)
     y_pos = np.arange(len(final_df))
-    ax.errorbar(final_df['HR'], y_pos, 
+    ax.errorbar(final_df['HR'], y_pos,
                 xerr=[final_df['HR'] - final_df['CI_lower'], final_df['CI_upper'] - final_df['HR']],
                 fmt='o', color='black')
     ax.axvline(x=1.0, color='grey', linestyle='--')
@@ -407,27 +463,35 @@ def cox_model_analysis(cohort):
     ax.set_yticks(y_pos)
     ax.set_yticklabels(final_df['Subgroup'] + " - " + final_df['Variable'], fontsize=9)
     ax.invert_yaxis()
-    ax.set_xlabel('Hazard Ratio (95% CI)', fontsize=10, fontweight='bold')
+    ax.set_xlabel('Hazard Ratio (95% CI)\n(restricted set)', fontsize=10, fontweight='bold')
 
-    plt.subplots_adjust(right=0.5, top=0.9)
-    
+    ax.set_position([0.05, 0.05, 0.45, 0.90])
+
     # table to the right of the plot
-    table_data = final_df[['HR_str', 'N', 'Events']].values
+    table_cols = ['HR_str', 'HR_extended', 'Hazard Ratio (Reference study)', 'N', 'Events']
+    col_labels = ['Hazard Ratio\n(restricted set)',
+                  'Hazard Ratio\n(extended set)',
+                  'Hazard Ratio\n(reference study)',
+                  'N\n(restricted/extended)',
+                  'Events\n(restricted/extended)']
 
-    table = plt.table(cellText=table_data,
-                    cellLoc='center',
-                    colLoc='center',
-                    bbox=[1.05, 0, 0.7, 1],
-                    edges='horizontal')
+    table_x0, table_w = 0.52, 0.62
+    table_ax = fig.add_axes([table_x0, 0.05, table_w, 0.90])
+    table_ax.axis('off')
+    table = table_ax.table(cellText=final_df[table_cols].values,
+                           cellLoc='center',
+                           colLoc='center',
+                           bbox=[0, 0, 1, 1],
+                           edges='horizontal')
     table.auto_set_font_size(False)
     table.set_fontsize(10)
-    table.scale(1.3, 1.3)
+    table.scale(1.2, 1.2)
 
     # table titles
-    fig.text(0.08, 0.92, 'Subgroup', ha='center', fontsize=10, fontweight='bold')
-    fig.text(0.56, 0.92, 'Hazard Ratio', ha='center', fontsize=10, fontweight='bold')
-    fig.text(0.64, 0.92, 'N', ha='center', fontsize=10, fontweight='bold')
-    fig.text(0.74, 0.92, 'Events', ha='center', fontsize=10, fontweight='bold')
+    fig.text(0.01, 0.97, 'Subgroup', ha='center', fontsize=10, fontweight='bold')
+    for i, label in enumerate(col_labels):
+        x = table_x0 + table_w * (i + 0.5) / len(col_labels)
+        fig.text(x, 0.97, label, ha='center', fontsize=10, fontweight='bold')
 
-    plt.savefig("src/results/cox_forest_ses_with_table.png", dpi=300, bbox_inches='tight')
+    plt.savefig("src/results/cox_forest_ses_with_table_benchmark.png", dpi=300, bbox_inches='tight')
     plt.close()
